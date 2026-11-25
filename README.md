@@ -6,22 +6,34 @@ Altairs (Argus-X) is an enterprise-grade, high-performance **Multi-Object Tracki
 
 ## 🔬 Technical Architecture & Methodology
 
-Altairs processes visual input through a three-stage sequential decoupled pipeline:
+Altairs processes visual input through a multi-stage sequential decoupled pipeline:
 
 ```mermaid
 flowchart TD
-    Video["Input Stream (Video / RTSP / Webcam)"] --> S1
+    Video["Input Stream (Video / RTSP / Webcam)"] --> P0
+    
+    subgraph P0["Stage 0: Image Preprocessing Pipeline"]
+        Letterbox["Letterbox Resizing (Aspect-Ratio Preservation)"]
+        Colorspace["Color-Space Conversion (BGR to RGB)"]
+        Norm["Normalization (Float32 / 255.0 & Channel Transpose HWC to CHW)"]
+        Letterbox --> Colorspace --> Norm
+    end
+    
+    P0 --> S1
     
     subgraph S1["Stage 1: Spatial Perception (Detector)"]
         YOLO["YOLOv8 / YOLO11 / YOLOX"]
-        YOLO --> BBOX["Bounding Boxes [x1, y1, x2, y2] + Confidence Scores"]
+        NMS["Non-Maximum Suppression (NMS)"]
+        YOLO --> NMS --> BBOX["Bounding Boxes [x1, y1, x2, y2] + Confidence Scores"]
     end
     
     S1 --> S2
     
-    subgraph S2["Stage 2: Feature Representation (ReID Embedding)"]
+    subgraph S2["Stage 2: Deep Appearance Extraction (ReID)"]
+        Crop["Detection Patch Cropping & Bilinear Resizing (256x128)"]
+        Standardize["ImageNet Mean/Std Normalization"]
         OSNET["OSNet / MobileNet Deep Feature Extractor"]
-        OSNET --> EMB["128-512D Visual Feature Embeddings"]
+        Crop --> Standardize --> OSNET --> EMB["128-512D Visual Feature Embeddings"]
     end
     
     S2 --> S3
@@ -37,15 +49,58 @@ flowchart TD
     S3 --> Out["Sink / Output: Annotated MP4 + JSONL Trajectory Stream"]
 ```
 
+---
+
+## ⚙️ Detailed Preprocessing Pipeline
+
+Raw video frames cannot be passed directly into neural networks. Altairs applies two distinct, specialized preprocessing pipelines before neural inference:
+
+### A. Detector Preprocessing Pipeline (Full Frame)
+Before feeding a full video frame (e.g., $1920 \times 1080$) into YOLO:
+
+1. **Letterbox Resizing (Aspect Ratio Preservation)**:
+   * Neural networks require fixed square dimensions (e.g., $640 \times 640$).
+   * Direct stretching distorts objects (making people look unnaturally wide or thin).
+   * **Letterboxing** scales the frame to fit within $640 \times 640$ while maintaining the exact original aspect ratio, filling the remaining border edges with uniform gray padding (`#727272` / RGB 114).
+2. **Color-Space Conversion**:
+   * OpenCV reads video frames in **BGR** format by default.
+   * PyTorch neural networks are trained on **RGB**. The channels are converted:
+     $$\text{BGR} \longrightarrow \text{RGB}$$
+3. **Data Type & Range Normalization**:
+   * Raw pixel values are integers ranging from $[0, 255]$ (`uint8`).
+   * Pixel values are cast to 32-bit floats (`float32`) and normalized to the range $[0.0, 1.0]$:
+     $$I_{\text{norm}} = \frac{I}{255.0}$$
+4. **Dimension Permutation (HWC $\to$ CHW)**:
+   * Video decoders produce arrays in Height $\times$ Width $\times$ Channels (`HWC`).
+   * Deep learning tensor engines (PyTorch/CUDA) require Channel-first memory layout: Batch $\times$ Channels $\times$ Height $\times$ Width (`BCHW`).
+
+---
+
+### B. ReID Feature Extractor Preprocessing Pipeline (Cropped Patches)
+Before extracting visual appearance fingerprints for re-identification:
+
+1. **Bounding Box Cropping**:
+   * Each detected person/vehicle is dynamically cropped from the original high-resolution frame using the detector's coordinates.
+2. **Standardized Patch Resizing**:
+   * Regardless of whether the person is near or far, each cropped patch is resized to standard ReID model dimensions (typically $256 \times 128$ for pedestrians) using bilinear interpolation.
+3. **Z-Score Standardization (ImageNet Normalization)**:
+   * Normalized using standard dataset mean ($\mu$) and standard deviation ($\sigma$):
+     $$I_{\text{standardized}} = \frac{I_{\text{norm}} - \mu}{\sigma}$$
+     $$\mu = [0.485, 0.456, 0.406], \quad \sigma = [0.229, 0.224, 0.225]$$
+
+---
+
+## 🧠 Perception & Spatio-Temporal Association
+
 ### 1. Spatial Perception (Detection Engine)
 * **Architectures**: Anchor-free and decoupled-head object detectors (**YOLOv8**, **YOLO11**, **YOLOX**).
-* **Task**: Locates objects per frame, producing localized spatial coordinates in normalized and pixel coordinate frames:
+* **Task**: Locates objects per frame, producing localized spatial coordinates:
   $$\mathbf{b} = [x_{\min}, y_{\min}, x_{\max}, y_{\max}, \text{score}, \text{class\_id}]$$
-* **Non-Maximum Suppression (NMS)**: Eliminates duplicate detections with configurable IoU thresholds (default: 0.7).
+* **Non-Maximum Suppression (NMS)**: Eliminates redundant overlapping boxes using IoU thresholding (default: 0.7).
 
 ### 2. Deep Visual Appearance & Re-Identification (ReID)
 * **Backbones**: Omni-Scale Network (**OSNet**), MobileNetV2, LMBN.
-* **Feature Extraction**: Extracts feature vectors capturing multi-scale structural and textural cues of each detection.
+* **Feature Extraction**: Produces feature vectors capturing multi-scale structural and textural cues of each detection.
 * **Cosine Distance Metric**:
   $$D_{\text{appearance}}(u, v) = 1 - \frac{\mathbf{f}_u \cdot \mathbf{f}_v}{\|\mathbf{f}_u\| \|\mathbf{f}_v\|}$$
 * Prevents identity swaps during heavy occlusions (e.g. crossing pedestrians or temporary obstruction behind pillars/signs).

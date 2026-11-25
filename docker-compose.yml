@@ -2,7 +2,6 @@ services:
   # 1. Headless HTTP Tracking REST Service
   service:
     image: boxmot/boxmot-service:latest
-    container_name: boxmot-service
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -19,7 +18,6 @@ services:
   # 2. CPU Tracking Job Runner
   tracker:
     image: boxmot/boxmot:latest-cpu
-    container_name: boxmot-tracker
     volumes:
       - .:/workspace
     working_dir: /workspace
@@ -39,7 +37,6 @@ services:
   # 3. GPU Tracking Job Runner (NVIDIA)
   tracker-gpu:
     image: boxmot/boxmot:latest-cpu
-    container_name: boxmot-tracker-gpu
     volumes:
       - .:/workspace
     working_dir: /workspace
