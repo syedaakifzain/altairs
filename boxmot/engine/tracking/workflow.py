@@ -1,0 +1,652 @@
+"""Canonical live-tracking workflow assembled from independent components."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from copy import copy
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from boxmot import create_tracker
+from boxmot.components.resolution import component_options
+from boxmot.detectors import Detector, DetectorSpec, create_detector
+from boxmot.detectors.config import resolve_detector_spec
+from boxmot.engine.config.runtime import resolve_mode_args
+from boxmot.engine.config.trackers import edgetam_checkpoint, resolve_tracker_options
+from boxmot.engine.tracking.profiling import RuntimeProfiler, profile_components, startup_stage
+from boxmot.engine.tracking.runner import RunSummary, TrackingRunner
+from boxmot.engine.tracking.sinks import (
+    DisplaySink,
+    JsonLinesSink,
+    MotSink,
+    NullSink,
+    SharedRenderingSink,
+    TrackSink,
+    VideoSink,
+)
+from boxmot.engine.tracking.sources import FrameSource, create_frame_source
+from boxmot.engine.ui.logging import suppress_boxmot_logs
+from boxmot.engine.ui.reporters.track import TrackWorkflowReporter
+from boxmot.engine.ui.workflow.pipeline import PipelineTracker
+from boxmot.pipelines import PipelineOutputs, TrackingPipeline
+from boxmot.reid import AppearanceEncoder, ReIDEncoderSpec, create_reid_encoder
+from boxmot.reid.config import resolve_reid_spec
+from boxmot.segmentors import Segmentor, create_segmentor
+from boxmot.segmentors.config import resolve_segmentor_spec
+from boxmot.trackers import ReIDConfigurableTracker, Tracker, TrackerSpec
+from boxmot.utils.devices import resolve_device
+
+if TYPE_CHECKING:
+    import numpy as np
+
+    from boxmot.trackers.common.mask_guidance import MaskGuidance, MaskGuidanceConfig
+
+
+@dataclass(frozen=True, slots=True)
+class TrackRun:
+    """Completed live run and any engine-owned output paths."""
+
+    summary: RunSummary
+    video_path: Path | None = None
+    mot_path: Path | None = None
+    json_path: Path | None = None
+    attributes_path: Path | None = None
+
+
+def _classes(value: object) -> tuple[int, ...] | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        parsed = tuple(sorted({int(token.strip()) for token in value.split(",") if token.strip()}))
+    else:
+        parsed = tuple(sorted({int(item) for item in value}))  # type: ignore[arg-type]
+    if any(item < 0 for item in parsed):
+        raise ValueError("classes must contain non-negative integer IDs")
+    return parsed
+
+
+def _component_device(args: Any, authored_device: str) -> str:
+    """Resolve one command override or authored component device for live execution."""
+
+    selected = getattr(args, "device", None)
+    if selected is None:
+        selected = "cpu" if authored_device.strip().lower() == "auto" else authored_device
+    return str(resolve_device(selected))
+
+
+def _detector_spec(args: Any, geometry: str) -> DetectorSpec:
+    """Resolve detector options and a validated device before model loading."""
+
+    spec, _ = resolve_detector_spec(args.detector, geometry=geometry)
+    options = spec.option_values()
+    if getattr(args, "conf", None) is not None:
+        options["confidence"] = float(args.conf)
+    if getattr(args, "iou", None) is not None:
+        options["iou"] = float(args.iou)
+    classes = _classes(getattr(args, "classes", None))
+    if classes is not None:
+        options["classes"] = classes
+    image_size = getattr(args, "imgsz", None)
+    if image_size is not None:
+        if isinstance(image_size, int):
+            options["image_size"] = (image_size, image_size)
+        else:
+            options["image_size"] = tuple(int(value) for value in image_size)
+    if getattr(args, "agnostic_nms", False):
+        options["agnostic_nms"] = True
+    return replace(
+        spec,
+        device=_component_device(args, spec.device),
+        options=tuple(sorted(options.items())),
+    )
+
+
+def _reid_spec(args: Any) -> ReIDEncoderSpec:
+    """Resolve a ReID selector with the direct-track runtime controls.
+
+    ``track --device`` historically places detector and ReID inference on the
+    same device, while ``--half`` controls ReID precision.  Component profiles
+    provide artifact and preprocessing defaults, but must not silently put a
+    live run into FP16 when the command reports FP32.
+    """
+
+    spec, _ = resolve_reid_spec(args.reid)
+    return replace(
+        spec,
+        device=_component_device(args, spec.device),
+        precision="fp16" if bool(getattr(args, "half", False)) else "fp32",
+    )
+
+
+def _tracker_spec(args: Any, geometry: str) -> TrackerSpec:
+    """Resolve tracker defaults, an optional runtime config, and CLI overrides."""
+
+    options = resolve_tracker_options(args, allow_prompted=True)
+    return TrackerSpec(
+        name=str(args.tracker),
+        backend=str(getattr(args, "tracker_backend", "python")),
+        geometry=geometry,
+        per_class=bool(getattr(args, "per_class", False) or options.get("per_class", False)),
+        class_ids=_classes(getattr(args, "classes", None)),
+        options=component_options(options),
+    )
+
+
+def _mask_guidance_config(args: Any, tracker_spec: TrackerSpec) -> MaskGuidanceConfig | None:
+    """Configure propagation of the frames delivered by the tracking workflow."""
+    checkpoint = edgetam_checkpoint(args)
+    if checkpoint is None:
+        return None
+    from boxmot.segmentors.propagation.factory import mask_propagation_device
+    from boxmot.segmentors.propagation.weights import resolve_edgetam_artifact
+    from boxmot.trackers.common.config import load_tracker_config
+    from boxmot.trackers.common.mask_guidance import mask_guidance_config_from_options, validate_mask_guidance_spec
+
+    validate_mask_guidance_spec(tracker_spec)
+    config = mask_guidance_config_from_options(
+        checkpoint=checkpoint,
+        device=str(getattr(args, "device", None) or "cuda"),
+        options=load_tracker_config(tracker_spec.name, None, tracker_spec.option_dict),
+    )
+    checkpoint = resolve_edgetam_artifact(checkpoint)
+    device = mask_propagation_device(checkpoint, config.device)
+    return replace(config, checkpoint=checkpoint, device=str(resolve_device(device)))
+
+
+def _share_edgetam_model(
+    args: Any,
+    config: MaskGuidanceConfig,
+) -> tuple[MaskGuidanceConfig | MaskGuidance, Segmentor | None]:
+    """Share matching segmentor/guidance weights within this tracking run only."""
+    from boxmot.segmentors.propagation.weights import is_edgetam_tflite_bundle
+
+    if is_edgetam_tflite_bundle(config.checkpoint):
+        return config, None
+
+    from boxmot.components.artifacts import sha256_artifact
+    from boxmot.segmentors.propagation.edgetam import EdgeTAMMaskPropagator
+    from boxmot.segmentors.propagation.model import effective_precision
+    from boxmot.trackers.common.mask_guidance import MaskGuidance
+
+    spec, _ = resolve_segmentor_spec(args.segmentor, geometry="aabb")
+    spec = replace(spec, device=_component_device(args, spec.device))
+    if (
+        spec.backend != "edgetam"
+        or resolve_device(spec.device) != resolve_device(config.device)
+        or spec.precision != effective_precision(config.device)
+        or spec.artifact_sha256 != sha256_artifact(config.checkpoint)
+    ):
+        return config, None
+    propagator = EdgeTAMMaskPropagator(
+        config.checkpoint,
+        device=config.device,
+        max_objects=config.max_objects,
+        prompt_overlap=config.prompt_overlap,
+    )
+    segmentor = create_segmentor(spec, model=propagator.predictor)
+    return MaskGuidance(config, propagator=propagator), segmentor
+
+
+def _detector_geometry(detector: Detector, requested: str) -> str:
+    """Resolve the loaded detector's output without reinterpreting its boxes."""
+
+    capabilities = detector.capabilities
+    supported = {
+        geometry
+        for geometry, enabled in (("aabb", capabilities.supports_aabb), ("obb", capabilities.supports_obb))
+        if enabled
+    }
+    if requested != "auto":
+        if requested not in supported:
+            produced = ", ".join(sorted(geometry.upper() for geometry in supported))
+            raise ValueError(
+                f"Detector produces {produced} boxes, which conflicts with requested geometry {requested!r}. "
+                "Use geometry='auto' to follow the detector."
+            )
+        return requested
+    if len(supported) != 1:
+        raise ValueError(
+            "Cannot infer tracking geometry because the detector does not declare one output geometry. "
+            "Configure the detector's capabilities or explicitly select geometry='aabb' or geometry='obb'."
+        )
+    return supported.pop()
+
+
+def _validate_tracker_geometry(tracker: Tracker, geometry: str) -> None:
+    """Check caller-owned tracker state without rebuilding or changing its geometry."""
+
+    is_obb = geometry == "obb"
+    configured = getattr(tracker, "is_obb", None)
+    if isinstance(configured, bool) and configured != is_obb:
+        current = "OBB" if configured else "AABB"
+        raise ValueError(
+            f"Injected tracker is configured for {current} geometry, "
+            f"but the detector produces {geometry.upper()} boxes. "
+            "Construct the tracker with matching geometry."
+        )
+    if is_obb and getattr(tracker, "supports_obb", True) is False:
+        raise ValueError("Injected tracker does not support the detector's OBB geometry.")
+
+
+def _output_directory(args: Any) -> Path:
+    """Reserve a run directory atomically, reusing it only with explicit consent."""
+    project = Path(getattr(args, "project", "runs/track"))
+    name = str(getattr(args, "name", "track") or "track")
+    output = project / name
+    if bool(getattr(args, "exist_ok", False)):
+        output.mkdir(parents=True, exist_ok=True)
+        return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    candidate = output
+    suffix = 2
+    while True:
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            candidate = output.with_name(f"{output.name}{suffix}")
+            suffix += 1
+
+
+def _default_sinks(
+    args: Any, *, output_dir: Path | None = None,
+    guidance_mask_provider: Callable[[], Mapping[int, np.ndarray]] | None = None,
+) -> tuple[tuple[TrackSink, ...], Path | None, Path | None, Path | None]:
+    """Build output sinks, sharing one optional guidance overlay per frame."""
+    sinks: list[TrackSink] = []
+    video_path = mot_path = json_path = None
+    video_sink: VideoSink | None = None
+    display_sink: DisplaySink | None = None
+    needs_directory = any(bool(getattr(args, name, False)) for name in ("save", "save_txt", "save_json"))
+    output = output_dir if output_dir is not None else (_output_directory(args) if needs_directory else None)
+    line_width = int(getattr(args, "line_width", 2) or 2)
+    show_labels = bool(getattr(args, "show_labels", True))
+    if bool(getattr(args, "save", False)):
+        assert output is not None
+        video_path = output / "tracks.mp4"
+        video_sink = VideoSink(
+            video_path,
+            fps=float(getattr(args, "fps", None) or 30.0),
+            line_width=line_width,
+            show_labels=show_labels,
+        )
+    if bool(getattr(args, "show", False)):
+        display_sink = DisplaySink(line_width=line_width, show_labels=show_labels)
+    if video_sink is not None and display_sink is not None:
+        sinks.append(
+            SharedRenderingSink(
+                (video_sink, display_sink),
+                line_width=line_width,
+                show_labels=show_labels,
+                guidance_mask_provider=guidance_mask_provider,
+            )
+        )
+    elif video_sink is not None:
+        sinks.append(
+            SharedRenderingSink(
+                (video_sink,),
+                line_width=line_width,
+                show_labels=show_labels,
+                guidance_mask_provider=guidance_mask_provider,
+            )
+            if guidance_mask_provider is not None
+            else video_sink
+        )
+    if bool(getattr(args, "save_txt", False)):
+        assert output is not None
+        mot_path = output / "tracks.txt"
+        mot_path.unlink(missing_ok=True)
+        sinks.append(MotSink(mot_path))
+    if bool(getattr(args, "save_json", False)):
+        assert output is not None
+        json_path = output / "tracks.jsonl"
+        json_path.unlink(missing_ok=True)
+        sinks.append(JsonLinesSink(json_path))
+    if display_sink is not None and video_sink is None:
+        sinks.append(
+            SharedRenderingSink(
+                (display_sink,),
+                line_width=line_width,
+                show_labels=show_labels,
+                guidance_mask_provider=guidance_mask_provider,
+            )
+            if guidance_mask_provider is not None
+            else display_sink
+        )
+    if not sinks:
+        sinks.append(NullSink())
+    return tuple(sinks), video_path, mot_path, json_path
+
+
+def run_track(
+    args: Any | None = None,
+    *,
+    detector: Detector | str | Path | None = None,
+    segmentor: Segmentor | str | Path | None = None,
+    encoder: AppearanceEncoder | None = None,
+    tracker: Tracker | str | None = None,
+    source: FrameSource | str | Path | int | None = None,
+    sinks: tuple[TrackSink, ...] | None = None,
+    ui_pipeline: PipelineTracker | None = None,
+    attributes: Any | None = None,
+    attributes_host: str | None = None,
+    **options: Any,
+) -> TrackRun:
+    """Track with optional components and a server override for attribute configs."""
+
+    if isinstance(detector, (str, Path)):
+        options["detector"] = detector
+        detector = None
+    if isinstance(segmentor, (str, Path)):
+        options["segmentor"] = segmentor
+        segmentor = None
+    if isinstance(tracker, str):
+        options["tracker"] = tracker
+        tracker = None
+    if isinstance(source, (str, Path, int)):
+        options["source"] = source
+        source = None
+    args = resolve_mode_args("track", args, options)
+    reference = attributes if attributes is not None else getattr(args, "attributes", None)
+    host = attributes_host if attributes_host is not None else getattr(args, "attributes_host", None)
+    if host is not None:
+        if reference is None:
+            raise ValueError("attributes_host requires an attribute profile or config via attributes.")
+        if not isinstance(reference, Mapping) and callable(getattr(reference, "update", None)):
+            raise ValueError("attributes_host cannot override a caller-owned attribute enricher.")
+        from boxmot.attributes.config import resolve_attribute_config
+
+        reference = replace(resolve_attribute_config(reference), host=host)
+    perception_explicit = any(options.get(name) is not None for name in ("detector", "segmentor", "reid"))
+    if reference is None:
+        return _run_track(
+            args,
+            detector=detector,
+            segmentor=segmentor,
+            encoder=encoder,
+            tracker=tracker,
+            source=source,
+            sinks=sinks,
+            ui_pipeline=ui_pipeline,
+            perception_explicit=perception_explicit,
+        )
+    from boxmot.engine.tracking.attributes import AttributeRun
+
+    with AttributeRun(
+        reference,
+        _output_directory(args),
+        progress=ui_pipeline.update if ui_pipeline is not None else None,
+    ) as attribute_run:
+        result = _run_track(
+            args,
+            detector=detector,
+            segmentor=segmentor,
+            encoder=encoder,
+            tracker=tracker,
+            source=source,
+            sinks=sinks,
+            ui_pipeline=ui_pipeline,
+            attribute_run=attribute_run,
+            perception_explicit=perception_explicit,
+        )
+        interrupted = attribute_run.finish(cancel=result.summary.interrupted)
+        return replace(
+            result,
+            attributes_path=attribute_run.path,
+            summary=replace(result.summary, interrupted=result.summary.interrupted or interrupted),
+        )
+
+
+def build_tracking_pipeline(
+    args: Any,
+    *,
+    detector: Any = None,
+    tracker: Any = None,
+    segmentor: Any = None,
+    encoder: Any = None,
+    attributes: Any = None,
+    profiler: RuntimeProfiler | None = None,
+    startup_timings_ms: dict[str, float] | None = None,
+    ui_pipeline: Any = None,
+) -> TrackingPipeline:
+    """Construct reusable perception/tracking components for finite and continuous runs."""
+    profiler = profiler if profiler is not None else RuntimeProfiler()
+    startup_timings_ms = startup_timings_ms if startup_timings_ms is not None else {}
+    requested_geometry = str(getattr(args, "geometry", "auto") or "auto")
+    if requested_geometry not in {"auto", "aabb", "obb"}:
+        raise ValueError("geometry must be 'auto', 'aabb' or 'obb'")
+    if getattr(args, "device", None) is not None:
+        resolve_device(args.device)
+    tracker_was_injected = tracker is not None
+    if edgetam_checkpoint(args) is not None and tracker is not None:
+        raise ValueError(
+            "Configure mask guidance on the supplied tracker instead of combining --edgetam with an injected tracker."
+        )
+    if tracker is None:
+        # Validate inexpensive tracker settings before loading model weights;
+        # geometry-dependent motion and calibration checks follow the detector.
+        preflight_args = copy(args)
+        preflight_args.geometry = None if requested_geometry == "auto" else requested_geometry
+        resolve_tracker_options(preflight_args, allow_prompted=True)
+        if edgetam_checkpoint(args) is not None:
+            from boxmot.trackers.common.mask_guidance import validate_mask_guidance_spec
+
+            validate_mask_guidance_spec(
+                _tracker_spec(preflight_args, requested_geometry if requested_geometry != "auto" else "aabb")
+            )
+
+    if detector is None:
+        if ui_pipeline is not None:
+            ui_pipeline.update("Loading detector…")
+        with startup_stage(startup_timings_ms, "detector_load"):
+            detector = create_detector(_detector_spec(args, requested_geometry))
+    geometry = _detector_geometry(detector, requested_geometry)
+    args.geometry = geometry
+    if tracker is None:
+        tracker_spec = _tracker_spec(args, geometry)
+        mask_guidance = _mask_guidance_config(args, tracker_spec)
+        if ui_pipeline is not None:
+            ui_pipeline.update("Loading tracker…")
+        with startup_stage(startup_timings_ms, "tracker_load"):
+            if (
+                mask_guidance is not None
+                and segmentor is None
+                and getattr(args, "segmentor", None) is not None
+                and not detector.capabilities.provides_masks
+            ):
+                mask_guidance, segmentor = _share_edgetam_model(args, mask_guidance)
+            tracker = (
+                create_tracker(tracker_spec, mask_guidance=mask_guidance)
+                if mask_guidance is not None
+                else create_tracker(tracker_spec)
+            )
+            requirements = tracker.requirements
+            generates_embeddings = getattr(tracker, "generates_embeddings", False)
+            if not isinstance(generates_embeddings, bool):
+                raise TypeError("tracker.generates_embeddings must be bool.")
+            if (
+                encoder is None
+                and requirements.embeddings
+                and generates_embeddings
+                and not detector.capabilities.provides_embeddings
+                and getattr(args, "reid", None) is not None
+            ):
+                if not isinstance(tracker, ReIDConfigurableTracker):
+                    raise TypeError(
+                        f"Tracker {tracker.name!r} declares internal embedding generation "
+                        "but does not implement configure_reid()."
+                    )
+                tracker.configure_reid(_reid_spec(args))
+    else:
+        _validate_tracker_geometry(tracker, geometry)
+
+    requirements = tracker.requirements
+    generates_embeddings = getattr(tracker, "generates_embeddings", False)
+    if not isinstance(generates_embeddings, bool):
+        raise TypeError("tracker.generates_embeddings must be bool.")
+    if (
+        encoder is None
+        and requirements.embeddings
+        and not detector.capabilities.provides_embeddings
+        and (not generates_embeddings or (tracker_was_injected and getattr(args, "reid", None) is not None))
+    ):
+        reference = getattr(args, "reid", None)
+        if reference is None:
+            raise ValueError(f"Tracker {tracker.name!r} requires embeddings; configure --reid ID_OR_YAML.")
+        if ui_pipeline is not None:
+            ui_pipeline.update("Loading appearance encoder…")
+        with startup_stage(startup_timings_ms, "reid_load"):
+            encoder = create_reid_encoder(_reid_spec(args))
+
+    segmentor_reference = getattr(args, "segmentor", None)
+    needs_masks = requirements.masks or bool(encoder is not None and encoder.requirements.masks)
+    detector_masks = detector.capabilities.provides_masks
+    if segmentor is None and (needs_masks or segmentor_reference is not None) and not detector_masks:
+        if segmentor_reference is None:
+            raise ValueError(f"Tracker {tracker.name!r} requires masks; configure --segmentor ID_OR_YAML.")
+        segmentor_spec, _ = resolve_segmentor_spec(segmentor_reference, geometry=geometry)
+        segmentor_spec = replace(segmentor_spec, device=_component_device(args, segmentor_spec.device))
+        if ui_pipeline is not None:
+            ui_pipeline.update("Loading segmentor…")
+        with startup_stage(startup_timings_ms, "segmentor_load"):
+            segmentor = create_segmentor(segmentor_spec)
+
+    with startup_stage(startup_timings_ms, "pipeline_prepare"):
+        detector, segmentor, encoder, tracker = profile_components(
+            profiler,
+            detector=detector,
+            segmentor=segmentor,
+            reid=encoder,
+            tracker=tracker,
+        )
+        tracking_pipeline = TrackingPipeline(
+            detector=detector,
+            tracker=tracker,
+            segmentor=segmentor,
+            reid=encoder,
+            outputs=PipelineOutputs(masks=segmentor_reference is not None),
+            attributes=attributes,
+        )
+    return tracking_pipeline
+
+
+def _run_track(
+    args: Any,
+    *,
+    detector: Detector | None = None,
+    segmentor: Segmentor | None = None,
+    encoder: AppearanceEncoder | None = None,
+    tracker: Tracker | None = None,
+    source: FrameSource | None = None,
+    sinks: tuple[TrackSink, ...] | None = None,
+    ui_pipeline: PipelineTracker | None = None,
+    attribute_run: Any | None = None,
+    perception_explicit: bool = False,
+) -> TrackRun:
+    """Assemble tracking while the caller owns optional attribute resources."""
+    from boxmot.trackers.edgetam.tracker import EdgeTAM
+
+    if getattr(args, "tracker", None) == "edgetam" or isinstance(tracker, EdgeTAM):
+        if edgetam_checkpoint(args) is not None:
+            raise ValueError("EdgeTAM prompt tracking cannot be combined with detector-based mask guidance.")
+        if any(component is not None for component in (detector, segmentor, encoder)) or perception_explicit:
+            raise ValueError("EdgeTAM prompt tracking does not use detector, segmentor, or ReID components.")
+        from boxmot.engine.tracking.prompted import run_prompted_track
+
+        return run_prompted_track(
+            args,
+            tracker=tracker,
+            source=source,
+            sinks=sinks,
+            ui_pipeline=ui_pipeline,
+            attribute_run=attribute_run,
+        )
+    profiler = RuntimeProfiler()
+    startup_timings_ms: dict[str, float] = {}
+    tracking_pipeline = build_tracking_pipeline(
+        args,
+        detector=detector,
+        tracker=tracker,
+        segmentor=segmentor,
+        encoder=encoder,
+        attributes=None if attribute_run is None else attribute_run.enricher,
+        profiler=profiler,
+        startup_timings_ms=startup_timings_ms,
+        ui_pipeline=ui_pipeline,
+    )
+    tracker = tracking_pipeline.tracker
+    if source is None:
+        if ui_pipeline is not None:
+            ui_pipeline.update("Opening frame source…")
+        with startup_stage(startup_timings_ms, "source_open"):
+            source = create_frame_source(
+                getattr(args, "source", "0"),
+                stride=int(getattr(args, "vid_stride", 1) or 1),
+            )
+    if sinks is None:
+        with startup_stage(startup_timings_ms, "output_prepare"):
+            provider = (
+                (lambda owner=tracker: owner.guidance_masks)
+                if getattr(tracker, "guidance_masks", None) is not None
+                else None
+            )
+            sinks, video_path, mot_path, json_path = _default_sinks(
+                args,
+                output_dir=attribute_run.path.parent if attribute_run is not None else None,
+                guidance_mask_provider=provider,
+            )
+    else:
+        video_path = mot_path = json_path = None
+
+    if ui_pipeline is not None:
+        ui_pipeline.advance("Processing frames…")
+
+    def _progress(frame_count: int, frame: Any, _result: Any) -> None:
+        if ui_pipeline is not None:
+            detail = f"Processed {frame_count} frame(s) • {frame.sample_id}"
+            if attribute_run is not None:
+                detail += f"\n{attribute_run.status_summary}"
+            ui_pipeline.update(detail)
+
+    runner = TrackingRunner(
+        source,
+        tracking_pipeline,
+        sinks=sinks,
+        progress=_progress if ui_pipeline is not None else None,
+        profiler=profiler,
+        startup_timings_ms=startup_timings_ms,
+        attribute_run=attribute_run,
+    )
+    for _frame, _result in runner.run():
+        pass
+    assert runner.summary is not None
+    return TrackRun(
+        summary=runner.summary,
+        video_path=video_path,
+        mot_path=mot_path,
+        json_path=json_path,
+    )
+
+
+def main(args: Any) -> TrackRun:
+    """CLI entry point."""
+
+    reporter = TrackWorkflowReporter(args)
+    pipeline = reporter.pipeline()
+    with pipeline:
+        with suppress_boxmot_logs(True, level="WARNING"):
+            result = run_track(args, ui_pipeline=pipeline)
+        output_dir = next(
+            (
+                path.parent
+                for path in (result.video_path, result.mot_path, result.json_path, result.attributes_path)
+                if path is not None
+            ),
+            None,
+        )
+        pipeline.finish(reporter.result(result), exp_dir=output_dir)
+        return result
+
+
+__all__ = ("TrackRun", "main", "run_track")

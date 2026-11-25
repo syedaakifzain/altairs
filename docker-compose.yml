@@ -1,0 +1,64 @@
+services:
+  # 1. Headless HTTP Tracking REST Service
+  service:
+    image: boxmot/boxmot-service:latest
+    container_name: boxmot-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - BOXMOT_SERVICE_PORT=8000
+      - BOXMOT_SERVICE_ASSO_FUNC=iou
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).read()\""]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # 2. CPU Tracking Job Runner
+  tracker:
+    image: boxmot/boxmot:latest-cpu
+    container_name: boxmot-tracker
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    environment:
+      - HOME=/tmp
+      - XDG_CACHE_HOME=/workspace/.cache
+    command: >
+      boxmot track
+        --source assets/MOT17-mini/train/MOT17-02-FRCNN/img1
+        --detector yolov8n
+        --tracker bytetrack
+        --device cpu
+        --project runs/docker
+        --save
+        --save-json
+
+  # 3. GPU Tracking Job Runner (NVIDIA)
+  tracker-gpu:
+    image: boxmot/boxmot:latest-cpu
+    container_name: boxmot-tracker-gpu
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    environment:
+      - HOME=/tmp
+      - XDG_CACHE_HOME=/workspace/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      boxmot track
+        --source assets/MOT17-mini/train/MOT17-02-FRCNN/img1
+        --detector yolov8n
+        --tracker bytetrack
+        --device 0
+        --project runs/docker-gpu
+        --save
+        --save-json
